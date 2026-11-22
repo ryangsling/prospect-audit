@@ -24,9 +24,11 @@ Read this whole file before writing code. Build in the phases listed at the bott
 Create `.env.example` with:
 
 ```
-GOOGLE_PLACES_API_KEY=        # Places API (New)
+APIFY_TOKEN=                  # primary source for Google listing + reviews
+APIFY_PLACES_ACTOR=compass~crawler-google-places
+APIFY_REVIEWS_ACTOR=compass~Google-Maps-Reviews-Scraper
+GOOGLE_PLACES_API_KEY=        # optional fallback, Places API (New)
 PAGESPEED_API_KEY=            # PageSpeed Insights API v5
-SERPAPI_KEY=                  # optional, for review owner-response rate
 APP_PASSWORD=                 # simple password gate for the internal UI
 AGENCY_NAME=Incodet
 AGENCY_URL=https://incodet.com
@@ -49,8 +51,11 @@ UI form (single page, password gated via middleware + cookie):
 - Prospect contact first name (optional, used in PDF greeting)
 
 Resolution logic:
-- If only a Maps URL or name+city is given, use Places API Text Search to find the place, then read `websiteUri` from the place to get the website.
-- If only a website is given, try to find the matching Google listing with Text Search using the page `<title>` / domain plus country. If confidence is low, skip listing checks and mark them `not_checked`.
+- Listing data comes from Apify first, via `POST https://api.apify.com/v2/acts/{APIFY_PLACES_ACTOR}/run-sync-get-dataset-items?token=...` with `maxCrawledPlacesPerSearch: 1`. Read name, address, website, phone, rating, review count, opening hours, place ID.
+- If `APIFY_TOKEN` is missing or the run fails, fall back to Places API (New) Text Search when `GOOGLE_PLACES_API_KEY` is set. Otherwise listing checks are `not_checked`.
+- If only a Maps URL or name+city is given, get the website from the listing.
+- If only a website is given, search the listing by page `<title>` / domain plus city/country. If name or domain does not match confidently, skip listing checks and mark them `not_checked`.
+- Put all Apify calls in `src/lib/clients/apify.ts`. Actor IDs come from env so a broken actor can be swapped without code changes. Map each actor's output into one internal `Listing` and `Review` type so the rest of the app never touches raw actor fields.
 
 ## 4. Checks
 
@@ -95,9 +100,10 @@ Combine:
 - Compute weekly closed hours from opening hours for use in the revenue model.
 
 ### 4.5 Google reviews and response rate
-From Places API (New) place details: `rating`, `userRatingCount`.
-- Owner response rate: Places API does not return owner replies. If `SERPAPI_KEY` is set, use SerpApi `google_maps_reviews` engine to fetch the most recent ~20 reviews and compute the % with an owner response, plus % of negative (1 to 3 star) reviews with a response.
-- If no SerpApi key: status `not_checked`, evidence "Response rate not checked".
+Rating and review count come from the listing.
+- Owner response rate: run `APIFY_REVIEWS_ACTOR` for the place, sorted newest, max 30 reviews. Compute % of reviews with an owner response, plus % of 1 to 3 star reviews with a response. Also record the newest unanswered negative review date.
+- Places API fallback does not return owner replies, so in fallback mode this check is `not_checked`, evidence "Response rate not checked".
+- Fewer than 5 reviews: status `not_checked`, evidence "Too few reviews to judge".
 - Pass >= 70% responded, partial 30 to 69%, fail < 30%.
 
 ### 4.6 Basic hygiene (small, low weight)
@@ -108,7 +114,9 @@ From Places API (New) place details: `rating`, `userRatingCount`.
 
 ### Fetching rules
 - Use a realistic browser User-Agent, 10s timeout per page, max 6 pages per site, follow redirects, respect robots.txt disallow for the paths you fetch.
-- Do not scrape Google Maps HTML directly. Use only Places API and SerpApi.
+- Do not scrape Google Maps HTML yourself. Use only Apify actors or Places API.
+- Apify runs take 20 to 90 seconds. Start the listing run, reviews run and PageSpeed call in parallel. Use a 120s timeout per Apify call and set route `maxDuration` accordingly. In batch mode, use async runs (`/runs` + poll) instead of run-sync.
+- Cache Apify results in memory per place ID for the life of the function to avoid paying twice when the PDF is regenerated after overrides.
 - Never throw on a single failed page; record it and continue.
 
 ## 5. Score
@@ -189,7 +197,7 @@ File name: `audit-<business-slug>-<yyyy-mm-dd>.pdf`
 
 Phase 1: Project scaffold, env handling, fetch layer, detectors 4.1, 4.2, 4.6 with fixtures and tests, `/api/audit` returning JSON for a website-only input. Acceptance: `pnpm test` and `pnpm build` pass.
 
-Phase 2: Places API resolution, 4.3 PageSpeed, 4.4 after-hours, 4.5 reviews (SerpApi optional), scoring, revenue model, UI with overrides. Acceptance: full JSON audit from either input type, tests pass.
+Phase 2: Apify listing resolution (Places API fallback), 4.3 PageSpeed, 4.4 after-hours, 4.5 reviews via Apify, save one real sample output from each actor in `tests/fixtures/apify/` for mapping tests, scoring, revenue model, UI with overrides. Acceptance: full JSON audit from either input type, tests pass.
 
 Phase 3: PDF generation, PDF download, outreach hook, password gate. Acceptance: PDF renders on one page for 3 fixture audits (save sample PDFs to `samples/`).
 
